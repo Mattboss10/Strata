@@ -44,7 +44,8 @@ contract LvrFeeHookTest is BaseTest {
         deployArtifactsAndLabel();
         (currency0, currency1) = deployCurrencyPair();
 
-        oracle = new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE);
+        address sustainabilityFeeRecipient = makeAddr("sustainabilityFeeRecipient");
+        oracle = new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, sustainabilityFeeRecipient, 0);
 
         // mine + deploy the hook to an address with only the beforeSwap flag set
         address flags = address(uint160(Hooks.BEFORE_SWAP_FLAG) ^ (0x5555 << 144));
@@ -99,6 +100,15 @@ contract LvrFeeHookTest is BaseTest {
         assertGe(fee, hook.MIN_FEE());
         assertLe(fee, hook.MAX_FEE());
         assertEq(fee, hook.MAX_FEE()); // in this case it should hit the ceiling exactly
+    }
+
+    function testFuzz_FeeAlwaysWithinBounds(uint256 predictedValue) public {
+        predictedValue = bound(predictedValue, 0, type(uint128).max);
+        _runOracleRound(predictedValue);
+
+        uint24 fee = hook.previewFee();
+        assertGe(fee, hook.MIN_FEE());
+        assertLe(fee, hook.MAX_FEE());
     }
 
     function testStaleSignalFallsBackToBaseFee() public {

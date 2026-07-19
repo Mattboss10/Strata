@@ -28,30 +28,28 @@ contract SignalOracle {
     mapping(uint256 => Round) internal rounds;
     uint256 public currentRoundId;
 
-    /// @notice Reputation acts as aggregation weight. Starts at BASE_REPUTATION on first commit.
     mapping(address => uint256) public reputation;
     uint256 public constant BASE_REPUTATION = 100;
 
-    /// @notice The last finalized aggregate. This is the one value the hook reads.
     uint256 public latestSignal;
-
-    /// @notice Timestamp of the last successful aggregation, so a consumer (like the
-    ///         hook) can detect a stale signal and fall back to a safe default.
     uint256 public lastSignalUpdate;
-
-    /// @notice Pull-payment balances, credited by settle(), withdrawn via withdraw().
     mapping(address => uint256) public pendingWithdrawals;
 
-    /// @notice Stand-in for an oracle/keeper role that posts the realized outcome after the fact.
     address public settler;
-
-    /// @notice A proposed new settler, awaiting acceptance. Two-step rotation avoids
-    ///         accidentally handing the role to an address that can't act on it.
     address public pendingSettler;
-
-    /// @notice Slashed stakes that couldn't be distributed this round (because nobody
-    ///         was accurate) roll forward here instead of sitting stuck permanently.
     uint256 public carryoverPool;
+
+    /// @notice A small share of slashed/forfeited stakes routed to this address, funding
+    ///         ongoing maintenance of the oracle and hook. Set once at deployment, never
+    ///         changeable by anyone afterward -- not even by this address itself. No
+    ///         setter function exists for either of these two values.
+    address public immutable sustainabilityFeeRecipient;
+    uint256 public immutable sustainabilityFeeBps;
+
+    /// @dev Hard ceiling on the sustainability fee, enforced at construction so no
+    ///      deployment can ever set a share large enough to gut the incentive for
+    ///      accurate reporting.
+    uint256 public constant MAX_SUSTAINABILITY_FEE_BPS = 2000; // 20%
 
     event Committed(uint256 indexed roundId, address indexed contributor, uint256 stake);
     event Revealed(uint256 indexed roundId, address indexed contributor, uint256 value);
@@ -77,18 +75,31 @@ contract SignalOracle {
     error SettleCurrentRoundFirst();
     error NothingToWithdraw();
     error RealizedValueOutOfBounds();
+    error InvalidSustainabilityFeeRecipient();
+    error SustainabilityFeeTooHigh();
 
-    constructor(address _settler, uint256 _commitDuration, uint256 _revealDuration, uint256 _minStake) {
+    constructor(
+        address _settler,
+        uint256 _commitDuration,
+        uint256 _revealDuration,
+        uint256 _minStake,
+        address _sustainabilityFeeRecipient,
+        uint256 _sustainabilityFeeBps
+    ) {
+        if (_sustainabilityFeeRecipient == address(0)) revert InvalidSustainabilityFeeRecipient();
+        if (_sustainabilityFeeBps > MAX_SUSTAINABILITY_FEE_BPS) revert SustainabilityFeeTooHigh();
+
         settler = _settler;
         commitDuration = _commitDuration;
         revealDuration = _revealDuration;
         minStake = _minStake;
+        sustainabilityFeeRecipient = _sustainabilityFeeRecipient;
+        sustainabilityFeeBps = _sustainabilityFeeBps;
         currentRoundId = 1;
         rounds[currentRoundId].startTime = block.timestamp;
         emit RoundStarted(currentRoundId, block.timestamp);
     }
 
-    /// @notice Submit a hidden prediction. commitment = keccak256(abi.encodePacked(value, salt)).
     function commit(bytes32 commitment) external payable {
         Round storage r = rounds[currentRoundId];
         if (block.timestamp >= r.startTime + commitDuration) revert CommitWindowClosed();
@@ -103,7 +114,6 @@ contract SignalOracle {
         emit Committed(currentRoundId, msg.sender, msg.value);
     }
 
-    /// @notice Reveal the value + salt behind your earlier commitment.
     function reveal(uint256 value, bytes32 salt) external {
         Round storage r = rounds[currentRoundId];
         if (block.timestamp < r.startTime + commitDuration) revert StillCommitting();
@@ -117,16 +127,12 @@ contract SignalOracle {
         emit Revealed(currentRoundId, msg.sender, value);
     }
 
-    /// @notice Current settler proposes a replacement. Doesn't take effect until accepted.
     function proposeSettlerRotation(address newSettler) external {
         if (msg.sender != settler) revert NotSettler();
         pendingSettler = newSettler;
         emit SettlerRotationProposed(newSettler);
     }
 
-    /// @notice The proposed address must accept before the rotation takes effect — this
-    ///         is what prevents accidentally handing the role to an address that can't
-    ///         act on it (a typo, a contract with no way to call settle(), etc.).
     function acceptSettlerRotation() external {
         if (msg.sender != pendingSettler) revert NotPendingSettler();
         address old = settler;
@@ -135,7 +141,6 @@ contract SignalOracle {
         emit SettlerRotated(old, settler);
     }
 
-    /// @notice Once the reveal window closes, anyone can trigger aggregation.
     function aggregateRound() external {
         Round storage r = rounds[currentRoundId];
         if (block.timestamp < r.startTime + commitDuration + revealDuration) revert RevealStillOpen();
@@ -166,12 +171,6 @@ contract SignalOracle {
         emit Aggregated(currentRoundId, r.aggregateValue, len);
     }
 
-    /// @notice Settler posts what actually happened. Rewards accurate reporters, slashes inaccurate
-    ///         ones, and never-revealed committers forfeit their stake entirely. Everything that
-    ///         gets slashed or forfeited this round is redistributed pro-rata to the accurate
-    ///         reporters in the SAME round — nothing sits parked in the contract with no way out.
-    ///         If nobody was accurate this round, the pool rolls forward to the next round that
-    ///         has at least one accurate reporter, rather than getting stuck.
     function settle(uint256 realizedValue) external {
         if (msg.sender != settler) revert NotSettler();
         Round storage r = rounds[currentRoundId];
@@ -188,7 +187,7 @@ contract SignalOracle {
         uint256 tolerance = realizedValue / 10;
         uint256 len = r.participants.length;
 
-        uint256 slashPool = carryoverPool;
+        uint256 newSlashPool = 0;
         uint256 accurateStakeTotal;
         bool[] memory isAccurate = new bool[](len);
 
@@ -198,7 +197,7 @@ contract SignalOracle {
 
             if (!r.revealed[p]) {
                 reputation[p] = reputation[p] > 20 ? reputation[p] - 20 : 1;
-                slashPool += stake;
+                newSlashPool += stake;
                 continue;
             }
 
@@ -210,29 +209,33 @@ contract SignalOracle {
             } else {
                 reputation[p] = reputation[p] > 10 ? reputation[p] - 10 : 1;
                 uint256 slashAmount = stake / 2;
-                slashPool += slashAmount;
+                newSlashPool += slashAmount;
                 pendingWithdrawals[p] += stake - slashAmount;
             }
         }
+
+        uint256 sustainabilityShare = (newSlashPool * sustainabilityFeeBps) / 10_000;
+        if (sustainabilityShare > 0) {
+            pendingWithdrawals[sustainabilityFeeRecipient] += sustainabilityShare;
+        }
+        uint256 distributable = carryoverPool + (newSlashPool - sustainabilityShare);
 
         if (accurateStakeTotal > 0) {
             for (uint256 i = 0; i < len; i++) {
                 if (!isAccurate[i]) continue;
                 address p = r.participants[i];
                 uint256 stake = r.stakes[p];
-                uint256 bonus = (slashPool * stake) / accurateStakeTotal;
+                uint256 bonus = (distributable * stake) / accurateStakeTotal;
                 pendingWithdrawals[p] += stake + bonus;
             }
             carryoverPool = 0;
         } else {
-            carryoverPool = slashPool;
+            carryoverPool = distributable;
         }
 
         emit Settled(currentRoundId, realizedValue);
     }
 
-    /// @notice Pull-payment withdrawal. Settling a round only credits a balance —
-    ///         it never sends ETH directly.
     function withdraw() external {
         uint256 amount = pendingWithdrawals[msg.sender];
         if (amount == 0) revert NothingToWithdraw();
@@ -241,7 +244,6 @@ contract SignalOracle {
         require(ok, "withdraw failed");
     }
 
-    /// @notice Starts the next round. Requires the current one to be fully settled.
     function startNextRound() external {
         if (!rounds[currentRoundId].settled) revert SettleCurrentRoundFirst();
         currentRoundId++;
@@ -249,7 +251,6 @@ contract SignalOracle {
         emit RoundStarted(currentRoundId, block.timestamp);
     }
 
-    /// @notice The one function the hook actually calls.
     function getCurrentSignal() external view returns (uint256) {
         return latestSignal;
     }

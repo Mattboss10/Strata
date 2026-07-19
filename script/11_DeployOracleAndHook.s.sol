@@ -17,7 +17,9 @@ contract DeployOracleAndHookScript is BaseScript {
             _settler: deployerAddress,
             _commitDuration: 2 minutes,
             _revealDuration: 2 minutes,
-            _minStake: 0.001 ether
+            _minStake: 0.001 ether,
+            _sustainabilityFeeRecipient: deployerAddress,
+            _sustainabilityFeeBps: 500
         });
 
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG);

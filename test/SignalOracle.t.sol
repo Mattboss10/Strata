@@ -19,13 +19,14 @@ contract SignalOracleTest is Test {
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
     address carol = makeAddr("carol");
+    address sustainabilityFeeRecipient = makeAddr("sustainabilityFeeRecipient");
 
     uint256 constant COMMIT_DURATION = 5 minutes;
     uint256 constant REVEAL_DURATION = 5 minutes;
     uint256 constant MIN_STAKE = 0.01 ether;
 
     function setUp() public {
-        oracle = new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE);
+        oracle = new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, sustainabilityFeeRecipient, 0);
         vm.deal(alice, 1 ether);
         vm.deal(bob, 1 ether);
         vm.deal(carol, 1 ether);
@@ -334,6 +335,79 @@ contract SignalOracleTest is Test {
 
         vm.prank(settler);
         oracle.settle(10_000);
+    }
+
+    function testSustainabilityFeeTakenFromSlashPool() public {
+        SignalOracle feeOracle = new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, sustainabilityFeeRecipient, 1000);
+
+        vm.deal(alice, 1 ether);
+        vm.deal(bob, 1 ether);
+        bytes32 aliceCommitment = keccak256(abi.encodePacked(uint256(1000), bytes32("s1")));
+        bytes32 bobCommitment = keccak256(abi.encodePacked(uint256(9000), bytes32("s2")));
+
+        vm.prank(alice);
+        feeOracle.commit{value: MIN_STAKE}(aliceCommitment);
+        vm.prank(bob);
+        feeOracle.commit{value: MIN_STAKE}(bobCommitment);
+
+        vm.warp(block.timestamp + COMMIT_DURATION + 1);
+        vm.prank(alice);
+        feeOracle.reveal(1000, "s1");
+        vm.prank(bob);
+        feeOracle.reveal(9000, "s2");
+
+        vm.warp(block.timestamp + REVEAL_DURATION + 1);
+        feeOracle.aggregateRound();
+
+        vm.prank(settler);
+        feeOracle.settle(1000);
+
+        uint256 bobSlash = MIN_STAKE / 2;
+        uint256 expectedShare = (bobSlash * 1000) / 10_000;
+
+        assertEq(feeOracle.pendingWithdrawals(sustainabilityFeeRecipient), expectedShare);
+
+        uint256 remainingAfterShare = bobSlash - expectedShare;
+        assertEq(feeOracle.pendingWithdrawals(alice), MIN_STAKE + remainingAfterShare);
+    }
+
+    function testSustainabilityFeeZeroWhenNoSlashOccurs() public {
+        SignalOracle feeOracle = new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, sustainabilityFeeRecipient, 1000);
+
+        vm.deal(alice, 1 ether);
+        bytes32 commitment = keccak256(abi.encodePacked(uint256(1000), bytes32("s1")));
+        vm.prank(alice);
+        feeOracle.commit{value: MIN_STAKE}(commitment);
+
+        vm.warp(block.timestamp + COMMIT_DURATION + 1);
+        vm.prank(alice);
+        feeOracle.reveal(1000, "s1");
+
+        vm.warp(block.timestamp + REVEAL_DURATION + 1);
+        feeOracle.aggregateRound();
+
+        vm.prank(settler);
+        feeOracle.settle(1000);
+
+        assertEq(feeOracle.pendingWithdrawals(sustainabilityFeeRecipient), 0);
+    }
+
+    function testSustainabilityFeeRecipientCannotBeZeroAddress() public {
+        vm.expectRevert(SignalOracle.InvalidSustainabilityFeeRecipient.selector);
+        new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, address(0), 500);
+    }
+
+    function testSustainabilityFeeCappedAtConstruction() public {
+        uint256 tooHigh = 2001;
+        vm.expectRevert(SignalOracle.SustainabilityFeeTooHigh.selector);
+        new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, sustainabilityFeeRecipient, tooHigh);
+
+        new SignalOracle(settler, COMMIT_DURATION, REVEAL_DURATION, MIN_STAKE, sustainabilityFeeRecipient, 2000);
+    }
+
+    function testSustainabilityFeeRecipientIsImmutable() public view {
+        assertEq(oracle.sustainabilityFeeRecipient(), sustainabilityFeeRecipient);
+        assertEq(oracle.sustainabilityFeeBps(), 0);
     }
 
     function testOnlySettlerCanSettle() public {

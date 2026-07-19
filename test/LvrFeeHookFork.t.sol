@@ -39,7 +39,8 @@ contract LvrFeeHookForkTest is Test {
         }
         assertGt(size, 0, "no contract at the expected PoolManager address on this fork");
 
-        oracle = new SignalOracle(settler, 5 minutes, 5 minutes, 0.01 ether);
+        address sustainabilityFeeRecipient = makeAddr("sustainabilityFeeRecipient");
+        oracle = new SignalOracle(settler, 5 minutes, 5 minutes, 0.01 ether, sustainabilityFeeRecipient, 0);
 
         address flags = address(uint160(Hooks.BEFORE_SWAP_FLAG) ^ (0x6666 << 144));
         bytes memory constructorArgs = abi.encode(poolManager, oracle);

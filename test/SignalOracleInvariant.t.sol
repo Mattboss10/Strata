@@ -22,7 +22,8 @@ contract SignalOracleInvariantTest is Test {
         actors[2] = makeAddr("invActor3");
         actors[3] = makeAddr("invActor4");
 
-        oracle = new SignalOracle(settler, 5 minutes, 5 minutes, 0.01 ether);
+        address sustainabilityFeeRecipient = makeAddr("sustainabilityFeeRecipient");
+        oracle = new SignalOracle(settler, 5 minutes, 5 minutes, 0.01 ether, sustainabilityFeeRecipient, 0);
         handler = new SignalOracleHandler(oracle, settler, actors);
 
         targetContract(address(handler));
